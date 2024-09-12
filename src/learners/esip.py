@@ -26,11 +26,10 @@ class Esip:
         self.expl = args.expl
         self.dis = args.dis
         self.goal = args.goal
-        #self.device = args.device #或许重复定义
 
         # 记录最后一次更新的时间
-        self.last_target_update_episode = 0 #target模型的最后更新轮次
-        self.last_gate_update_episode = 0 #经验共享和经验接收门的最后更新轮次
+        self.last_target_update_episode = 0
+        self.last_gate_update_episode = 0
         # 选择mixer
         self.mixer = None
         if args.mixer is not None:
@@ -41,30 +40,29 @@ class Esip:
             else:
                 raise ValueError("Mixer {} not recognised.".format(args.mixer))
             self.target_mixer = copy.deepcopy(self.mixer)
-        # 改动，分开做了mix和q的优化器与参数变量
+
         self.mixer_params = list(self.mixer.parameters())
         self.q_params = list(mac.parameters())
         self.mixer_optimiser = RMSprop(params=self.mixer_params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
         self.q_optimiser = RMSprop(params=self.q_params, lr=args.lr, alpha=args.optim_alpha, eps=args.optim_eps)
 
-        # 深拷贝有点浪费（如重复动作选择器），但对任何 MAC 都适用
+
         self.target_mac = copy.deepcopy(mac)
-        # 记录数据的间隔轮数
+
         self.log_stats_t = -self.args.learner_log_interval - 1
-        #计算distence的网络
+
         self.distance = nn.Sequential(
             nn.Linear(self.mac.scheme1['obs']['vshape'], 128),
             nn.ReLU(),
             nn.Linear(128, args.n_actions)
         ).to(device=self.device)
-        #记录分布门对应信息
-        self.q_mean=th.zeros([1,1,1]) #智能体经验tderror分布的均值
-        self.q_std=th.zeros([1,1,1]) #智能体经验tderror分布的方差
-        self.q_down_value=th.zeros([1,1,1])  #智能体经验tderror分布的均值-方差
-        self.q_up_value=th.zeros([1,1,1])  #智能体经验tderror分布的均值+方差
+
+        self.q_mean=th.zeros([1,1,1])
+        self.q_std=th.zeros([1,1,1])
+        self.q_down_value=th.zeros([1,1,1])
+        self.q_up_value=th.zeros([1,1,1])
 
     def train(self, batch: EpisodeBatch, t_env: int, episode_num: int):
-        # 获取相关变量
         rewards = batch["reward"][:, :-1]
         reward = batch["reward"][:, :-1]
         actions = batch["actions"][:, :-1]
@@ -76,18 +74,14 @@ class Esip:
         avail_actions = batch["avail_actions"]
         indi_terminated = batch["indi_terminated"][:, :-1].float()
 
-        # 将经验导入到agent的网络计算Q函数
         mac_out = []
         self.mac.init_hidden(batch.batch_size)
         for t in range(batch.max_seq_length):
             agent_outs = self.mac.forward(batch, t=t)
             mac_out.append(agent_outs)
-        mac_out = th.stack(mac_out, dim=1)  # 随时间串联输出。 根据obs选择 动作 实际动作
+        mac_out = th.stack(mac_out, dim=1)
 
-        #筛选经验选中动作的分数，顺便去掉轨迹数目维度
-
-        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)  # Remove the last dim
-        #ind_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3) #多余变量
+        chosen_action_qvals = th.gather(mac_out[:, :-1], dim=3, index=actions).squeeze(3)
 
         # 使用target模型计算经验的Q函数
         target_mac_out = []
@@ -96,79 +90,64 @@ class Esip:
             target_agent_outs = self.target_mac.forward(batch, t=t)
             target_mac_out.append(target_agent_outs)
 
-        target_ind_q = th.stack(target_mac_out[:-1], dim=1)  ## 将个体的target_Q函数值全部拷贝下来，并按照时间链接
-        target_mac_out = th.stack(target_mac_out[1:], dim=1)  # 计算目标时，我们不需要第一个时间步的 Q 值估计值，去除后按照时间链接
+        target_ind_q = th.stack(target_mac_out[:-1], dim=1)
+        target_mac_out = th.stack(target_mac_out[1:], dim=1)
 
-        # 将无法执行动作的Q函数值做负极大值掩膜
         target_mac_out[avail_actions[:, 1:] == 0] = -9999999
-        target_ind_q[avail_actions[:, :-1] == 0] = -9999999  # Q values  ##########################
+        target_ind_q[avail_actions[:, :-1] == 0] = -9999999
 
         # #计算target_Q值的最大值
         if self.args.double_q:
-            # #获取最大化实时Q的行动（DOUBLE-Qlearning）
             mac_out_detach = mac_out.clone().detach()
-            mac_out_detach[avail_actions == 0] = -9999999 #对模型输出中的不可行动作Q函数做掩膜
-            cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1]#求每个时间步的最大Q函数动作
+            mac_out_detach[avail_actions == 0] = -9999999
+            cur_max_actions = mac_out_detach[:, 1:].max(dim=3, keepdim=True)[1]
 
-            cur_max_act = mac_out_detach[:, :-1].max(dim=3, keepdim=True)[1]  #记录当前每一步的最大Q函数动作，包括第一步，备用
+            cur_max_act = mac_out_detach[:, :-1].max(dim=3, keepdim=True)[1]
 
-            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) #获取target模型计算的1-N时间步最大Q函数动
-            target_individual_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3) #多余变量
-            target_ind_qvals = th.gather(target_ind_q, 3, cur_max_act).squeeze(3)  #从包括第一步在内的每步最大动作来筛选对应个体Q函数
+            target_max_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
+            target_individual_qvals = th.gather(target_mac_out, 3, cur_max_actions).squeeze(3)
+            target_ind_qvals = th.gather(target_ind_q, 3, cur_max_act).squeeze(3)
         else:
-            target_max_qvals = target_mac_out.max(dim=3)[0] #获取target模型计算的1-N时间步最大Q函数动作的对应Q值
+            target_max_qvals = target_mac_out.max(dim=3)[0]
             target_individual_qvals = target_mac_out.max(dim=3)[0]
 
-        # 求解全局Q函数值
         if self.mixer is not None:
             chosen_action_qvals_clone = chosen_action_qvals.clone().detach()
             chosen_action_qvals_clone.requires_grad = True
             target_max_qvals_clone = target_max_qvals.clone().detach()
 
-            chosen_action_q_tot_vals = self.mixer(chosen_action_qvals_clone, batch["state"][:, :-1])#计算选中动作的全局Q函数
-            target_max_q_tot_vals = self.target_mixer(target_max_qvals_clone, batch["state"][:, 1:])#计算target模型选中动作的全局Q函数
-            goal_target_max_qvals = self.target_mixer(target_ind_qvals, batch["state"][:, :-1])#计算个体Q组成的全局Q函数
+            chosen_action_q_tot_vals = self.mixer(chosen_action_qvals_clone, batch["state"][:, :-1])
+            target_max_q_tot_vals = self.target_mixer(target_max_qvals_clone, batch["state"][:, 1:])
+            goal_target_max_qvals = self.target_mixer(target_ind_qvals, batch["state"][:, :-1])
 
-        #####################################################################################################
-        #本部分计算全局内在奖励
-
-        # 计算ind_tot，也就是每个智能体的子目标
-        q_ind_tot_list = []#每个agent的子目标的清单，是MASER论文的变量
+        q_ind_tot_list = []
         for i in range(self.n_agents):
-            target_qtot_per_agent = (goal_target_max_qvals / self.n_agents).squeeze()# 每个agent平均分到的全局Q函数贡献
-            q_ind_tot_list.append(self.alpha * target_ind_qvals[:, :, i] + (1 - self.alpha) * target_qtot_per_agent)#计算每个agent的子目标
+            target_qtot_per_agent = (goal_target_max_qvals / self.n_agents).squeeze()
+            q_ind_tot_list.append(self.alpha * target_ind_qvals[:, :, i] + (1 - self.alpha) * target_qtot_per_agent)
 
-        q_ind_tot = th.stack(q_ind_tot_list, dim=2)#规整子目标清单格式，按第二维拼接
+        q_ind_tot = th.stack(q_ind_tot_list, dim=2)
 
-        ddqn_qval_up_idx = th.max(q_ind_tot, dim=1)[1]  # 找出 t=1~T-1的最大 Q 值（对全部episode）
+        ddqn_qval_up_idx = th.max(q_ind_tot, dim=1)[1]
 
-        #explore_q_target = th.ones(target_ind_q.shape) / target_ind_q.shape[-1] #多余变量
-        #explore_q_target = explore_q_target.to(device=self.device)
 
-        # 计算double-DQN的更新清单和距离计算清单
-        ddqn_up_list = [] #double-DQN的更新清单
-        distance_list = [] #距离清单
+        ddqn_up_list = []
+        distance_list = []
         for i in range(batch.batch_size):
             ddqn_up_list_subset = []
             distance_subset = []
-            explore_loss_subset = [] #探索部分被删除了，多余变量
+            explore_loss_subset = []
             for j in range(self.n_agents):
                 # For distance function
 
-                cos = nn.CosineSimilarity(dim=-1, eps=1e-8) #余弦相似度计算对象
-                #cos1 = nn.CosineSimilarity() 多余变量
+                cos = nn.CosineSimilarity(dim=-1, eps=1e-8)
                 goal_q = target_ind_q[i, ddqn_qval_up_idx[i][j], j, :].repeat(target_ind_q.shape[1], 1)
-                #a = cos(target_ind_q[i, :, j, :], goal_q) 多余变量
-                #b = cos1(target_ind_q[i, :, j, :], goal_q) 多余变量
-                similarity = 1 - cos(target_ind_q[i, :, j, :], goal_q) #通过target模型的个体Q函数值和子目标Q值来计算相似度
-                dist_obs = self.distance(observation[i, :, j, :]) #计算观察的距离
-                dist_og = self.distance(observation[i, ddqn_qval_up_idx[i][j], j, :]) #计算子目标对应观察的距离
+                similarity = 1 - cos(target_ind_q[i, :, j, :], goal_q)
+                dist_obs = self.distance(observation[i, :, j, :])
+                dist_og = self.distance(observation[i, ddqn_qval_up_idx[i][j], j, :])
 
-                # 计算距离损失
                 dist_loss = th.norm(dist_obs - dist_og.repeat(dist_obs.shape[0], 1), dim=-1) - similarity
                 distance_loss = th.mean(dist_loss ** 2)
 
-                # 将Q子目标对应的状态观察和episode[i]j号agent距离子目标的距离损失载入清单
                 distance_subset.append(distance_loss)
                 ddqn_up_list_subset.append(observation[i, ddqn_qval_up_idx[i][j], j, :])
 
@@ -178,17 +157,15 @@ class Esip:
             ddqn_up1 = th.stack(ddqn_up_list_subset)
             ddqn_up_list.append(ddqn_up1)
 
-        # 计算子目标距离损失函数
         distance_losses = th.stack(distance_list)
-        mix_explore_distance_losses = self.dis * distance_losses #乘上系数
+        mix_explore_distance_losses = self.dis * distance_losses
 
-        # 按照double-DQN计算奖励
         ddqn_up = th.stack(ddqn_up_list)
         ddqn_up = ddqn_up.unsqueeze(dim=1)
         ddqn_up = ddqn_up.repeat(1, observation.shape[1], 1, 1)
         reward_ddqn_up = self.distance(observation) - self.distance(ddqn_up)
 
-        # 计算内在奖励
+
         intrinsic_reward_list = []
         for i in range(self.n_agents):
             intrinsic_reward_list.append(
@@ -201,50 +178,44 @@ class Esip:
                                                                                      1) / self.n_agents
         rewards += self.lam * intrinsic_rewards
 
-        ####################################################################
-        # 计算TD-error
         targets = rewards + self.args.gamma * (1 - terminated) * target_max_q_tot_vals  # (B,T,1)#计算和筛选targetQ函数值
         td_error = (chosen_action_q_tot_vals - targets.detach())  # (B,T,1)
         #td_error_1 = (chosen_action_q_tot_vals - reward - self.args.gamma * (1 - terminated) * target_max_q_tot_vals) 多余变量
-
-        #掩膜tderror
         mask = mask.expand_as(td_error)
         masked_td_error = td_error * mask
 
-        #计算混合网络的损失函数
+
         mix_explore_distance_loss = mix_explore_distance_losses.mean()
         mixer_loss = (masked_td_error ** 2).sum() / mask.sum() + 0.001 * self.mix * mix_explore_distance_loss
 
-        # 优化混合网络
+
         self.mixer_optimiser.zero_grad()
         chosen_action_qvals_clone.retain_grad()  # the grad of qi
         chosen_action_q_tot_vals.retain_grad()  # the grad of qtot
         mixer_loss.backward()
-
-        #计算mixer梯度信息，作为计算智能体内在奖励的一部分
         grad_l_qtot = chosen_action_q_tot_vals.grad.repeat(1, 1, self.args.n_agents) + 1e-8
         grad_l_qi = chosen_action_qvals_clone.grad
         grad_qtot_qi = th.clamp(grad_l_qi / grad_l_qtot, min=-10, max=10)  # (B,T,n_agents)
         mixer_grad_norm = th.nn.utils.clip_grad_norm_(self.mixer_params, self.args.grad_norm_clip)
         self.mixer_optimiser.step()
 
-        #计算智能体的tderror
+
         q_rewards = self.cal_indi_reward(grad_qtot_qi, td_error, chosen_action_qvals, target_max_qvals,
                                          indi_terminated)  # (B,T,n_agents)(td_error_1)
         q_rewards_clone = q_rewards.clone().detach()
         q_targets = q_rewards_clone + self.args.gamma * (1 - indi_terminated) * target_max_qvals  # (B,T,n_agents)计算，筛选智能体单独target的Q函数值
-        q_td_error = (chosen_action_qvals - q_targets.detach())  # (B,T,n_agents) 计算智能体单独的TD-ERROR
+        q_td_error = (chosen_action_qvals - q_targets.detach())
 
-        #做掩膜
+
         q_mask = batch["filled"][:, :-1].float().repeat(1, 1, self.args.n_agents)  # (B,T,n_agents)
         q_mask[:, 1:] = q_mask[:, 1:] * (1 - indi_terminated[:, :-1]) * (1 - terminated[:, :-1]).repeat(1, 1,
                                                                                                         self.args.n_agents)
         q_mask = q_mask.expand_as(q_td_error)
         q2_mask = th.cat((q_mask, q_mask), dim=0)
         masked_q_td_error = q_td_error * q_mask
-        masked_q_td_error = masked_q_td_error.to(self.device)#更新，GPU加速
+        masked_q_td_error = masked_q_td_error.to(self.device)
 
-        #按照正态分布计算tderror的上下限（均值+-标准差）
+
         down_value = th.zeros((masked_q_td_error.shape[0], self.n_agents))
         up_value = th.zeros((masked_q_td_error.shape[0], self.n_agents))
         self.q_mean, self.q_std, self.q_down_value, self.q_up_value = self.sum_and_sig(masked_q_td_error,
@@ -253,32 +224,29 @@ class Esip:
         self.q_std = self.q_std.to(self.device)
         self.q_up_value = self.q_up_value.to(self.device)
         self.q_down_value = self.q_down_value.to(self.device)
-        #计算共享tderror的清单
+
         # if self.args.gate_calculate_method == "normal":
         #     receive_list = self.calculate_receive_list_normal(masked_q_td_error=masked_q_td_error)
         # elif self.args.gate_calculate_method == "abs":
         #     receive_list = self.calculate_receive_list_abs(masked_q_td_error=masked_q_td_error)
 
 
-        #更新共享清单计算方式
         q_up_value_clone = self.q_up_value.unsqueeze(1).repeat(1, masked_q_td_error.shape[1], 1)
         q_up_value_clone = q_up_value_clone.to(self.device)
         q_down_value_clone = self.q_down_value.unsqueeze(1).repeat(1, masked_q_td_error.shape[1], 1)
         q_down_value_clone = q_down_value_clone.to(self.device)
         share_gate_mask = (masked_q_td_error >= q_up_value_clone) + (masked_q_td_error <= q_down_value_clone)# 计算掩膜
         share_gate_mask = share_gate_mask.to(self.device)
-        share_list = masked_q_td_error * share_gate_mask  # 使用掩膜生成分享清单
+        share_list = masked_q_td_error * share_gate_mask
         share_list = share_list.to(self.device)
 
-        # 旧计算方式
         # share_list = th.zeros((masked_q_td_error.shape[0], masked_q_td_error.shape[1], self.n_agents))
         # for i in range(masked_q_td_error.shape[0]):
         #     for j in range(masked_q_td_error.shape[1]):
         #         for agent in range(self.n_agents):
         #             if masked_q_td_error[i][j][agent] >= self.q_up_value[i][agent] or masked_q_td_error[i][j][agent] <= \
-        #                     self.q_down_value[i][agent]:# 如果掩膜后的td_error在均值-+标准差之外，就在清单上对应位置写上这个tderror
+        #                     self.q_down_value[i][agent]:
         #                 share_list[i][j][agent] = masked_q_td_error[i][j][agent]
-        # 判断操作是否等价，完全等价
         # for i in range(share_list.shape[0]):
         #     for j in range(share_list.shape[1]):
         #         for k in range(share_list.shape[2]):
@@ -286,84 +254,60 @@ class Esip:
         #                 print("error")
         # print("end")
 
-        #更新计算接收tderror的清单
-        receive_list = th.zeros(share_list.shape[0], masked_q_td_error.shape[1], self.n_agents).to(
-            self.device)  # 第三维存所有接受的tderror的和
-        # receive_list_count = th.zeros(share_list.shape[0], masked_q_td_error.shape[1], self.n_agents).to(
-        #     self.device)  # 第三维存接受了几个tderror
-        for dim in range(self.n_agents):  # 逐个智能体计算门掩膜，重组share数据
-            # 修改share_list格式
-            share_list_dim = share_list[:, :, dim]  # 截取分享清单第dim智能体分享的数据
-            share_list_dim = share_list_dim.unsqueeze(2).repeat(1, 1, self.n_agents)  # 增加第三维，把agent[dim]的经验数据铺给每个agent
-            share_list_dim[:, :, dim] = th.zeros_like(share_list_dim[:, :, dim])  # 删去分享给自己的经验
-            # 制作掩膜
-            receive_q_mask = (share_list_dim >= q_up_value_clone) + ((share_list_dim <= q_down_value_clone) * (share_list_dim !=0)) #避免出现空值替代
-            receive_q_mask = receive_q_mask.to(self.device)
-            # 获取筛选后结果
-            receive_list_dim = receive_q_mask * share_list_dim
-            # 获取接收计数
-            # receive_count_dim = th.ones(share_list.shape[0], masked_q_td_error.shape[1], self.n_agents)
-            # receive_count_dim = receive_count_dim.to(self.device)
-            # receive_count_dim = receive_count_dim * receive_q_mask
-            # 结果加入总记录
-            receive_list[receive_q_mask] = receive_list_dim[receive_q_mask]
-            # receive_list_count = receive_list_count + receive_count_dim
-            receive_list = receive_list.to(self.device)
-            # receive_list_count = receive_list_count.to(self.device)
-            # 对接受的tderror取平均值，每个episode，每个step，每个agent接收的tderor应为其与此接受的其他agent的tderror的均值
-        # receive_list = receive_list / (receive_list_count)
-        # receive_list = th.where(receive_list_count != 0, th.div(receive_list, receive_list_count), th.tensor(0).to(self.device))
-        # receive_list[receive_list_count == 0] = 0  # 将计数为0的部分改为0
-        receive_list = receive_list.to(self.device)
-
-       #计算接受共享tderror的清单
-        # print(share_list.detach().numpy())
-        # print(share_list.sum())
-        # receive_list = th.zeros(share_list.shape[0], masked_q_td_error.shape[1], self.n_agents)
+        # receive_list = th.zeros(share_list.shape[0], masked_q_td_error.shape[1], self.n_agents).to(
+        #     self.device)
+        # # receive_list_count = th.zeros(share_list.shape[0], masked_q_td_error.shape[1], self.n_agents).to(
+        # #     self.device)
+        # for dim in range(self.n_agents):
+        #     # 修改share_list格式
+        #     share_list_dim = share_list[:, :, dim]
+        #     share_list_dim = share_list_dim.unsqueeze(2).repeat(1, 1, self.n_agents)
+        #     share_list_dim[:, :, dim] = th.zeros_like(share_list_dim[:, :, dim])
+        #     receive_q_mask = (share_list_dim >= q_up_value_clone) + ((share_list_dim <= q_down_value_clone) * (share_list_dim !=0)) #避免出现空值替代
+        #     receive_q_mask = receive_q_mask.to(self.device)
+        #     receive_list_dim = receive_q_mask * share_list_dim
+        #     # receive_count_dim = th.ones(share_list.shape[0], masked_q_td_error.shape[1], self.n_agents)
+        #     # receive_count_dim = receive_count_dim.to(self.device)
+        #     # receive_count_dim = receive_count_dim * receive_q_mask
+        #     receive_list[receive_q_mask] = receive_list_dim[receive_q_mask]
+        #     # receive_list_count = receive_list_count + receive_count_dim
+        #     receive_list = receive_list.to(self.device)
+        #     # receive_list_count = receive_list_count.to(self.device)
+        # # receive_list = receive_list / (receive_list_count)
+        # # receive_list = th.where(receive_list_count != 0, th.div(receive_list, receive_list_count), th.tensor(0).to(self.device))
+        # # receive_list[receive_list_count == 0] = 0
         # receive_list = receive_list.to(self.device)
-        # for i in range(masked_q_td_error.shape[0]):
-        #     for j in range(masked_q_td_error.shape[1]):
-        #         dim = 0
-        #         for agent in range(self.n_agents):
-        #             if agent == dim:
-        #                 receive_list[i][j][agent] = 0 #不接受自己发出的经验
-        #             else:
-        #                 if share_list[i][j][dim] >= self.q_up_value[i][agent] or share_list[i][j][dim] <= self.q_down_value[i][agent]:
-        #                     # 如果分享单子上记着的tderror在自己这边也在均值+-标准差之外，记录
-        #                     receive_list[i][j][agent] = share_list[i][j][dim]#修改，改为加和
-        #         dim = dim + 1
 
+        print(share_list.detach().numpy())
+        print(share_list.sum())
+        receive_list = th.zeros(share_list.shape[0], masked_q_td_error.shape[1], self.n_agents)
+        receive_list = receive_list.to(self.device)
+        for i in range(masked_q_td_error.shape[0]):
+            for j in range(masked_q_td_error.shape[1]):
+                dim = 0
+                for agent in range(self.n_agents):
+                    if agent == dim:
+                        receive_list[i][j][agent] = 0
+                    else:
+                        if share_list[i][j][dim] >= self.q_up_value[i][agent] or share_list[i][j][dim] <= self.q_down_value[i][agent]:
+                            receive_list[i][j][agent] = share_list[i][j][dim]
+                dim = dim + 1
 
-        # 判断操作是否等价
-        # for i in range(receive_list.shape[0]):
-        #     for j in range(receive_list.shape[1]):
-        #         for k in range(receive_list.shape[2]):
-        #             if receive_list_1[i][j][k] != receive_list[i][j][k]:
-        #                 print("error:",receive_list_1[i][j][k],receive_list[i][j][k])
-        # print("end")
-
-        # 计算智能体的loss
-        # 链接接受清单的tderror和智能体原有的tderror
         masked_q_td_error = th.cat((masked_q_td_error, receive_list), dim=0)
-        # 计算轨迹的PER优先级权重和选取比率
         q_selected_weight, selected_ratio = self.select_trajectory(masked_q_td_error.abs(), q2_mask, t_env)
         q_selected_weight = q_selected_weight.clone().detach()
-        # 计算智能体的loss
         q_loss = (masked_q_td_error ** 2 * q_selected_weight).sum() / q2_mask.sum()
 
-        # 对智能体网络做优化
         self.q_optimiser.zero_grad()
         q_loss.backward()
         q_grad_norm = th.nn.utils.clip_grad_norm_(self.q_params, self.args.grad_norm_clip)
         self.q_optimiser.step()
 
-        # 定期更新target模型
         if (episode_num - self.last_target_update_episode) / self.args.target_update_interval >= 1.0:
             self._update_targets()
             self.last_target_update_episode = episode_num
 
 
-        #定期打印信息
         if t_env - self.log_stats_t >= self.args.learner_log_interval:
             self.logger.log_stat("selected_ratio", selected_ratio, t_env)
             self.logger.log_stat("mixer_loss", mixer_loss.item(), t_env)
