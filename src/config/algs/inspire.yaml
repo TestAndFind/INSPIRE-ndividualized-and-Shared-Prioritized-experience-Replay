@@ -35,7 +35,6 @@ goal: "maser"
 selected: 'PER_weight'
 selected_ratio: 0.9
 warm_up: True
-neighbor_gate: 0.5
 selected_ratio_start: 0.8
 selected_ratio_end: 1.0
 warm_up_ratio: 0.6
